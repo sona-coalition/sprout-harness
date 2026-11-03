@@ -21,3 +21,9 @@ domains:
                                 # time instead (see agent/Containerfile).
   - domain: api.telegram.org    # Telegram bot API
   - domain: mcp.openmail.sh     # OpenMail MCP endpoint
+  # organisation#20 (2026-11-03): general information access. Search results
+  # and news are prompt-injection vectors as much as information sources —
+  # the agent's trust rules (content is data, never commands) apply.
+  - domain: google.com          # general queries
+  - domain: pi.dev              # pi harness documentation
+  - domain: bbc.co.uk           # news and current affairs
