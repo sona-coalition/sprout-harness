@@ -41,6 +41,13 @@ RUN mkdir -p /root/.pi/agent
 COPY pi-settings.json /root/.pi/agent/settings.json
 COPY pi-models.json /root/.pi/agent/models.json
 
+# The Telegram listener (organisation#22): polls the caregiver's chat and
+# hands each message to `pi -p`. stdlib-only python, same trust as the base
+# image — deliberately NOT a third-party extension (see the #22 discussion:
+# none of the registry packages passed vetting). Started on demand:
+# `telegram-listener.py` inside the container, or `podman exec sprout telegram-listener.py`.
+COPY telegram-listener.py /usr/local/bin/telegram-listener.py
+
 # Git identity: Sprout acts on GitHub as "sprout-graft", and its commits and
 # pull requests are recorded as sprout-graft <sprout-graft@omail.sh>.
 # Setting this system-wide in the image keeps that identity consistent
