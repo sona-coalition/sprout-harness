@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
-"""telegram-listener.py — respond to caregiver Telegram messages without a chat cycle.
+"""telegram-listener.py — respond to Telegram messages without a chat cycle.
 
-Polls the Telegram Bot API and, for each new message from the caregiver's
-chat, invokes `pi -p` once with the message and the standard startup
-instruction. This is the first increment of organisation#22 (respond on
-message); email and GitHub polling are later increments.
+WHAT THIS FILE IS
+-----------------
+A small, deliberately readable poller. It watches the caregiver's Telegram
+chat and hands each new message to `pi -p` once, so Sprout can answer
+without waiting for a chat cycle. First increment of organisation#22;
+email and GitHub polling are later increments.
 
-Design notes:
+THE TRUST RULE, AS IMPLEMENTED
+------------------------------
+Only messages from the caregiver's chat are *acted on* — passed to pi with
+instructions. Everything else is data, not commands (see
+organisation/principles.md §5). Strangers are not ignored, though: each
+unknown chat gets one polite canned reply explaining what this bot is,
+so a human who finds it is not met with silence. No LLM is invoked for
+strangers — a canned reply carries no injection risk and costs nothing.
 
-- Only messages from the caregiver's chat ID are acted on (the trust rule:
-  everything else is data, not commands) — others are logged and ignored.
-- The getUpdates offset is persisted in the private subsona so restarts do
-  not replay messages. A reply is not a consume: the offset advances only
-  after the message has been handed to pi.
-- The listener runs inside the live instance's container; the LIVE lock
-  (checked by start.sh before the container starts) is what keeps two
-  listeners from ever polling the same bot (Telegram 409 Conflict).
+(Note on naming: "support entity" is the new name for the role long called
+"caregiver"; the rename is being applied across documents. This file uses
+"support entity" in comments and "caregiver" only where it must match the
+current text of memory/people.md.)
 
-Requires: TELEGRAM_BOT_TOKEN in the environment (from the harness env file).
-Stdlib only — no pip installs, same trust as the base image.
+STATE
+-----
+- The getUpdates offset lives in the private subsona (.telegram-offset),
+  so restarts do not replay messages and a reply is never mistaken for a
+  consume (see notes/operational-findings.md).
+- Stranger chats already greeted live in .telegram-seen-chats, same place.
+
+SAFEGUARDS
+----------
+- Runs only inside the live instance's container; start.sh's LIVE-lock
+  check is what keeps two listeners from polling the same bot (Telegram
+  409 Conflict is the tell if that ever happens).
+- stdlib only — no pip installs, same trust as the base image.
+
+Requires TELEGRAM_BOT_TOKEN in the environment (from the harness env file).
 """
 
 import json
@@ -31,15 +49,21 @@ import time
 import urllib.request
 import urllib.error
 
-POLL_TIMEOUT = 25          # Telegram long-poll seconds
+POLL_TIMEOUT = 25          # seconds per Telegram long-poll request
 ERROR_BACKOFF = 30         # seconds to wait after a network/API failure
-STATE_PATH = os.environ.get(
-    "TELEGRAM_OFFSET_FILE",
-    "/home/sprout/sprout/sprout-private/.telegram-offset",
+STATE_DIR = os.environ.get(
+    "TELEGRAM_STATE_DIR",
+    "/home/sprout/sprout/sprout-private",
 )
+OFFSET_PATH = os.path.join(STATE_DIR, ".telegram-offset")
+SEEN_CHATS_PATH = os.path.join(STATE_DIR, ".telegram-seen-chats")
 PEOPLE_PATH = os.environ.get(
     "TELEGRAM_PEOPLE_FILE",
     "/home/sprout/sprout/sprout-private/memory/people.md",
+)
+STRANGER_REPLY = (
+    "Hello! I am Sprout, an automated agent. I can't take instructions "
+    "here, but I've noted your message for my support entity."
 )
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -51,12 +75,19 @@ _running = True
 
 
 def _stop(signum, frame):
+    """Signal handler: ask the main loop to finish the current poll and exit."""
     global _running
     _running = False
 
 
-def caregiver_chat_id():
-    """Read the caregiver's chat ID from memory/people.md (private subsona)."""
+def support_entity_chat_id():
+    """Return the support entity's chat ID, read from the private subsona.
+
+    Input:  TELEGRAM_PEOPLE_FILE (default: memory/people.md in the mount).
+    Output: the chat ID string, e.g. "5177204362".
+    Exits the process with a message if the file or the ID is missing —
+    without the ID there is no safe way to tell command from data.
+    """
     try:
         text = open(PEOPLE_PATH, encoding="utf-8").read()
     except OSError:
@@ -68,6 +99,14 @@ def caregiver_chat_id():
 
 
 def api(method, **params):
+    """Call one Telegram Bot API method and return the `result` payload.
+
+    method: the API method name, e.g. "getUpdates".
+    params: keyword arguments sent as the JSON body.
+    Returns: the decoded "result" field of Telegram's response.
+    Raises: RuntimeError if Telegram reports ok=false; URLError on network
+    failure (the caller backs off and retries).
+    """
     data = json.dumps(params).encode()
     req = urllib.request.Request(
         f"{API}/{method}", data=data, headers={"Content-Type": "application/json"}
@@ -80,22 +119,44 @@ def api(method, **params):
 
 
 def read_offset():
+    """Return the next update ID to ask for; 0 means 'no offset stored yet'."""
     try:
-        return int(open(STATE_PATH, encoding="utf-8").read().strip())
+        return int(open(OFFSET_PATH, encoding="utf-8").read().strip())
     except (OSError, ValueError):
         return 0
 
 
 def write_offset(value):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
+    """Persist the next update ID so restarts never replay messages."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(OFFSET_PATH, "w", encoding="utf-8") as f:
         f.write(str(value))
 
 
-def handle_message(chat_id, text, date):
-    """Hand one caregiver message to pi, non-interactively."""
+def seen_chats():
+    """Return the set of stranger chat IDs already sent the canned reply."""
+    try:
+        return set(json.load(open(SEEN_CHATS_PATH, encoding="utf-8")))
+    except (OSError, ValueError):
+        return set()
+
+
+def mark_chat_seen(chat_id):
+    """Record a stranger chat as greeted, so we greet it at most once."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(SEEN_CHATS_PATH, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen_chats() | {chat_id}), f)
+
+
+def handle_support_message(text):
+    """Hand one support-entity message to pi, non-interactively.
+
+    The invoked pi runs the full startup flow in AGENTS.md — including the
+    LIVE-lock check — before handling the message, exactly as if a human
+    had typed the same request into a chat.
+    """
     prompt = (
-        "A Telegram message has arrived from your caregiver. Follow your "
+        "A Telegram message has arrived from your support entity. Follow your "
         "startup instructions in AGENTS.md (including the LIVE lock check), "
         "then handle this message. Quote: " + text
     )
@@ -103,15 +164,28 @@ def handle_message(chat_id, text, date):
     subprocess.run(["pi", "-p", prompt], check=False)
 
 
+def greet_stranger(chat_id):
+    """Send the one-time canned reply to a chat that is not the support entity's."""
+    if chat_id in seen_chats():
+        return
+    api("sendMessage", chat_id=int(chat_id), text=STRANGER_REPLY)
+    mark_chat_seen(chat_id)
+    print(f"telegram-listener: greeted stranger chat {chat_id} (once)")
+
+
 def main():
+    """Poll forever: consume updates, act on support messages, greet strangers.
+
+    On the very first run there is no stored offset, so we skip history
+    entirely (start from the latest update) rather than replaying it.
+    """
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    wanted = caregiver_chat_id()
+    wanted = support_entity_chat_id()
     me = api("getMe")
     print(f"telegram-listener: polling as @{me['username']}; "
-          f"acting only on chat {wanted}; offset {read_offset() or 'latest'}")
+          f"acting on chat {wanted}; offset {read_offset() or 'latest'}")
     if read_offset() == 0:
-        # First run: do not replay history — start from the latest update.
         updates = api("getUpdates", timeout=0, offset=-1)
         if updates:
             write_offset(updates[-1]["update_id"] + 1)
@@ -123,16 +197,18 @@ def main():
             time.sleep(ERROR_BACKOFF)
             continue
         for update in updates:
+            # Consume first: the offset advances before handling, so a crash
+            # mid-handling never replays a message.
             write_offset(update["update_id"] + 1)
             msg = update.get("message") or {}
             chat = str((msg.get("chat") or {}).get("id", ""))
             text = msg.get("text")
             if not text:
-                continue
-            if chat != wanted:
-                print(f"telegram-listener: ignoring message from chat {chat}")
-                continue
-            handle_message(chat, text, msg.get("date"))
+                continue                      # photos, stickers, joins: nothing to do
+            if chat == wanted:
+                handle_support_message(text)
+            else:
+                greet_stranger(chat)
 
 
 if __name__ == "__main__":
