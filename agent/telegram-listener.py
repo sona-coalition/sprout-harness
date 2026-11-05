@@ -122,6 +122,30 @@ def api(method, **params):
     return payload["result"]
 
 
+def api_with_retry(method, **params):
+    """Call api() until it succeeds, backing off ERROR_BACKOFF between tries.
+
+    Startup companion to the poll loop's error handling, for the calls
+    main() makes before the loop begins (getMe, the first-run offset peek):
+    the listener is a daemon, and a daemon waits for its network rather
+    than dying. Added after the 2026-11-05 full restart, when start.sh
+    launched the listener about a second after the egress proxy and the
+    first getMe reached squid before it was listening — the unguarded
+    ConnectionRefusedError killed the container before it ever reached
+    the poll loop (organisation#30).
+
+    Honours _running, so SIGTERM during a startup retry still stops us.
+    """
+    while _running:
+        try:
+            return api(method, **params)
+        except (urllib.error.URLError, RuntimeError) as e:
+            print(f"telegram-listener: {method}: {e}; "
+                  f"retrying in {ERROR_BACKOFF}s")
+            time.sleep(ERROR_BACKOFF)
+    sys.exit("telegram-listener: stopped before startup completed")
+
+
 def read_offset():
     """Return the next update ID to ask for; 0 means 'no offset stored yet'."""
     try:
@@ -252,13 +276,13 @@ def main():
     # --- 2. Who is talking, and who is listening -----------------------------
     print(f"telegram-listener: guards passed ({info})")
     wanted = support_entity_chat_id()
-    me = api("getMe")
+    me = api_with_retry("getMe")
     print(f"telegram-listener: polling as @{me['username']}; "
           f"acting on chat {wanted}; offset {read_offset() or 'latest'}")
 
     # --- 3. First run: start from the latest update, no history replay -------
     if read_offset() == 0:
-        updates = api("getUpdates", timeout=0, offset=-1)
+        updates = api_with_retry("getUpdates", timeout=0, offset=-1)
         if updates:
             write_offset(updates[-1]["update_id"] + 1)
 
