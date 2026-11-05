@@ -176,39 +176,60 @@ def greet_stranger(chat_id):
 def main():
     """Poll forever: consume updates, act on support messages, greet strangers.
 
-    On the very first run there is no stored offset, so we skip history
-    entirely (start from the latest update) rather than replaying it.
+    The loop in four parts:
+      1. Install signal handlers so shutdowns are clean (SIGTERM/SIGINT).
+      2. Work out who the support entity is (from people.md) and who we are
+         (getMe), then say both aloud in the log.
+      3. On the very first run only: skip history entirely by starting from
+         the latest update — no replay of everything that arrived while we
+         were offline.
+      4. Poll forever. Each update is HANDLED FIRST and the offset advanced
+         AFTER, so a crash can replay a message (a duplicate reply is
+         recoverable) but never silently lose one.
     """
+    # --- 1. Clean shutdown on signals ---------------------------------------
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+
+    # --- 2. Who is talking, and who is listening -----------------------------
     wanted = support_entity_chat_id()
     me = api("getMe")
     print(f"telegram-listener: polling as @{me['username']}; "
           f"acting on chat {wanted}; offset {read_offset() or 'latest'}")
+
+    # --- 3. First run: start from the latest update, no history replay -------
     if read_offset() == 0:
         updates = api("getUpdates", timeout=0, offset=-1)
         if updates:
             write_offset(updates[-1]["update_id"] + 1)
+
+    # --- 4. The poll loop -----------------------------------------------------
     while _running:
+        # 4a. Fetch any new updates. On network/API failure, back off and try
+        # again rather than spinning or dying.
         try:
             updates = api("getUpdates", timeout=POLL_TIMEOUT, offset=read_offset())
         except (urllib.error.URLError, RuntimeError) as e:
             print(f"telegram-listener: {e}; retrying in {ERROR_BACKOFF}s")
             time.sleep(ERROR_BACKOFF)
             continue
+
+        # 4b. Handle each update, THEN advance the offset. Handle-first means
+        # at-least-once delivery: a crash mid-handling may replay a message
+        # (a duplicate reply — recoverable and visible) but cannot lose it
+        # silently (a lost support message — much worse).
         for update in updates:
-            # Consume first: the offset advances before handling, so a crash
-            # mid-handling never replays a message.
-            write_offset(update["update_id"] + 1)
             msg = update.get("message") or {}
             chat = str((msg.get("chat") or {}).get("id", ""))
             text = msg.get("text")
             if not text:
+                write_offset(update["update_id"] + 1)
                 continue                      # photos, stickers, joins: nothing to do
             if chat == wanted:
                 handle_support_message(text)
             else:
                 greet_stranger(chat)
+            write_offset(update["update_id"] + 1)
 
 
 if __name__ == "__main__":
