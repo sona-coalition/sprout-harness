@@ -39,6 +39,7 @@ SAFEGUARDS
 Requires TELEGRAM_BOT_TOKEN in the environment (from the harness env file).
 """
 
+import fcntl
 import json
 import os
 import re
@@ -65,6 +66,9 @@ STRANGER_REPLY = (
     "Hello! I am Sprout, an automated agent. I can't take instructions "
     "here, but I've noted your message for my support entity."
 )
+LOCK_PATH = os.path.join(STATE_DIR, "LIVE")
+HANDLING_LOCK_PATH = os.path.join(STATE_DIR, ".telegram-handling.lock")
+LOCK_STALE_SECONDS = 4 * 60 * 60  # 4 hours, per runbook §7
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -173,10 +177,54 @@ def greet_stranger(chat_id):
     print(f"telegram-listener: greeted stranger chat {chat_id} (once)")
 
 
+def lock_status():
+    """Inspect the LIVE lock without taking it.
+
+    Returns (state, info): state is "clear" (no lock, or stale), or "live"
+    (a fresh lock held by someone). Freshness uses started_epoch when
+    present, falling back to file mtime, so old-format locks still work.
+    The listener READS the lock but never takes or releases it — that is
+    the woken agent's job (AGENTS.md).
+    """
+    try:
+        text = open(LOCK_PATH, encoding="utf-8").read()
+        mtime = os.path.getmtime(LOCK_PATH)
+    except OSError:
+        return "clear", "no lock"
+    host = (re.search(r"^host: (.+)$", text, re.M) or [None, "unknown"])[1]
+    epoch = re.search(r"^started_epoch: (\d+)$", text, re.M)
+    age = time.time() - (int(epoch.group(1)) if epoch else mtime)
+    if age < LOCK_STALE_SECONDS:
+        return "live", f"host {host}, {int(age)}s old"
+    return "clear", f"stale lock ({host}, {int(age)}s old)"
+
+
+def handling_guard():
+    """Serialize message handling across ALL listener processes.
+
+    The duplicate wake of 2026-11-05 (two boots, two replies, one ping)
+    proved that 'something' can double-fire. Whatever the cause — two
+    listeners, a retry, a race — a non-blocking flock on a shared file
+    makes concurrent handling impossible: the second contender skips and
+    logs instead of waking a second Sprout. The lock releases when the
+    process holding it exits (kernel guarantee), so crashes cannot wedge.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fh = open(HANDLING_LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh  # caller keeps it open for the lifetime of the listener
+
+
 def main():
     """Poll forever: consume updates, act on support messages, greet strangers.
 
-    The loop in four parts:
+    The loop in five parts:
+      0. Guards: refuse to start if another instance is live, and take the
+         handling flock so no two handlers ever run at once.
       1. Install signal handlers so shutdowns are clean (SIGTERM/SIGINT).
       2. Work out who the support entity is (from people.md) and who we are
          (getMe), then say both aloud in the log.
@@ -187,11 +235,22 @@ def main():
          AFTER, so a crash can replay a message (a duplicate reply is
          recoverable) but never silently lose one.
     """
+    # --- 0. Guards ------------------------------------------------------------
+    state, info = lock_status()
+    if state == "live":
+        sys.exit(f"telegram-listener: another instance is live ({info}). "
+                 "The listener and an interactive session never run together — "
+                 "shut one down first (runbook §7).")
+    guard = handling_guard()
+    if guard is None:
+        sys.exit("telegram-listener: another handler is already active; refusing to double-fire.")
+
     # --- 1. Clean shutdown on signals ---------------------------------------
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
     # --- 2. Who is talking, and who is listening -----------------------------
+    print(f"telegram-listener: guards passed ({info})")
     wanted = support_entity_chat_id()
     me = api("getMe")
     print(f"telegram-listener: polling as @{me['username']}; "
