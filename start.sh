@@ -10,7 +10,9 @@
 #   2. Builds two container images: the agent and the egress proxy.
 #   3. Creates two container networks: one with no route out, one with access.
 #   4. Starts the egress proxy attached to both networks.
-#   5. Starts the agent attached ONLY to the closed network, so its only
+#   5. Starts the Telegram listener as a daemon container (unless
+#      SPROUT_LISTENER=off), so `start.sh` is the whole story (organisation#22).
+#   6. Starts the agent attached ONLY to the closed network, so its only
 #      way to reach the internet is through the proxy.
 #
 # Expected layout (plain nested clones; each outer repo gitignores the
@@ -158,6 +160,35 @@ podman run -d --name sprout-egress \
 #                             path inside the container as outside it.
 # `exec` replaces this script with the podman process, so stopping the
 # container (Ctrl-C) ends the script cleanly. --rm tidies up on exit.
+# --- 5.5 Start the Telegram listener (daemon container) ---------------------
+# A second container from the SAME image, running the listener as a daemon:
+# it polls the support entity's chat and hands messages to `pi -p` inside
+# itself. Same env file, same mounts, same egress proxy as the agent.
+# Set SPROUT_LISTENER=off to skip it.
+#
+# Concurrency note (v1): if a human is mid-conversation in the interactive
+# session below (which then holds the LIVE lock), a listener-booted `pi -p`
+# will see the fresh lock and politely report not-live in the listener's
+# logs — no corruption, no double-self; the next message retries. The
+# resident-mode successor (runbook §6 note) removes this overlap properly.
+if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
+  echo "(Re)starting Telegram listener (SPROUT_LISTENER=off to disable)..."
+  podman rm -f sprout-telegram >/dev/null 2>&1 || true
+  podman run -d --name sprout-telegram \
+    --network sprout-inside \
+    --env-file "$ENV_FILE" \
+    -e HTTP_PROXY=http://sprout-egress:3128 \
+    -e HTTPS_PROXY=http://sprout-egress:3128 \
+    -e http_proxy=http://sprout-egress:3128 \
+    -e https_proxy=http://sprout-egress:3128 \
+    --memory 1g --cpus 1 --pids-limit 256 \
+    -v "$PWD/sprout:/home/sprout/sprout:Z" \
+    -v "$PWD/sprout/sprout-private:/home/sprout/sprout/sprout-private:Z" \
+    sprout telegram-listener.py
+  echo "  (listener logs: podman logs -f sprout-telegram)"
+fi
+
+# --- 6. Start the agent ------------------------------------------------------
 echo "Starting Sprout (memory ${MEMORY_LIMIT}, cpus ${CPU_LIMIT})..."
 exec podman run -it --rm \
   --name sprout \

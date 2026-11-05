@@ -7,3 +7,7 @@
 
 # Secrets never belong here; .env lives at the root but is never committed
 .env
+
+# Python build artifacts
+__pycache__/
+*.pyc
