@@ -40,6 +40,16 @@ SAFEGUARDS
 - Runs only inside the live instance's container; start.sh's LIVE-lock
   check is what keeps two listeners from polling the same bot (Telegram
   409 Conflict is the tell if that ever happens).
+- One bad update cannot kill the channel: every per-update handling path
+  in the poll loop is guarded, unexpected exceptions are logged with the
+  update id, and the loop carries on (issue #15).
+- The container runs with a restart policy, so the startup guards WAIT
+  rather than exit: a fresh LIVE lock parks the listener (rechecked until
+  the lock clears or goes stale), and the handling flock is waited on too
+  — an exiting guard under a restart policy is a crash-loop (issue #16).
+- Log lines go to stdout AND a host-mounted file (issue #17): `podman
+  logs` dies with the container and start.sh recreates sprout-telegram on
+  every run, which destroyed incident evidence on 2026-11-06 — twice.
 - stdlib only — no pip installs, same trust as the base image.
 
 Requires TELEGRAM_BOT_TOKEN in the environment (from the harness env file).
@@ -75,6 +85,9 @@ STRANGER_REPLY = (
 LOCK_PATH = os.path.join(STATE_DIR, "LIVE")
 HANDLING_LOCK_PATH = os.path.join(STATE_DIR, ".telegram-handling.lock")
 LOCK_STALE_SECONDS = 4 * 60 * 60  # 4 hours, per runbook §7
+LOCK_RECHECK_SECONDS = 60         # cadence for parked guards to re-check (#16)
+LOG_DIR = os.environ.get("TELEGRAM_LOG_DIR", "/var/log/sprout")
+LOG_PATH = os.path.join(LOG_DIR, "telegram-listener.log")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
@@ -88,6 +101,29 @@ def _stop(signum, frame):
     """Signal handler: ask the main loop to finish the current poll and exit."""
     global _running
     _running = False
+
+
+def log(msg):
+    """One UTC-timestamped line to stdout AND the persistent log file.
+
+    stdout alone is not enough (#17): `podman logs` output is held inside
+    the container, and start.sh recreates sprout-telegram on every run —
+    on 2026-11-06 the recreation itself destroyed the evidence of why the
+    listener had died. start.sh bind-mounts a host directory at LOG_DIR,
+    so the file survives recreation and is readable on the host.
+    Best-effort: without the mount (e.g. `podman exec` into the agent
+    container, or an old start.sh) stdout alone carries the line and the
+    listener runs on. Message CONTENT is never logged — ids, lengths and
+    descriptions only — because the file outlives the container.
+    """
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}"
+    print(line)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def support_entity_chat_id():
@@ -146,7 +182,7 @@ def api_with_retry(method, **params):
         try:
             return api(method, **params)
         except (urllib.error.URLError, RuntimeError) as e:
-            print(f"telegram-listener: {method}: {e}; "
+            log(f"telegram-listener: {method}: {e}; "
                   f"retrying in {ERROR_BACKOFF}s")
             time.sleep(ERROR_BACKOFF)
     sys.exit("telegram-listener: stopped before startup completed")
@@ -243,7 +279,7 @@ def handle_support_nontext(msg):
         "content, say so on-channel so your support entity knows to "
         "re-send it as text."
     )
-    print(f"telegram-listener: handing non-text message to pi ({desc})")
+    log(f"telegram-listener: handing non-text message to pi ({desc})")
     subprocess.run(["pi", "-p", prompt], check=False)
 
 
@@ -259,7 +295,7 @@ def handle_support_message(text):
         "startup instructions in AGENTS.md (including the LIVE lock check), "
         "then handle this message. Quote: " + text
     )
-    print(f"telegram-listener: handing message to pi ({len(text)} chars)")
+    log(f"telegram-listener: handing message to pi ({len(text)} chars)")
     subprocess.run(["pi", "-p", prompt], check=False)
 
 
@@ -269,7 +305,64 @@ def greet_stranger(chat_id):
         return
     api("sendMessage", chat_id=int(chat_id), text=STRANGER_REPLY)
     mark_chat_seen(chat_id)
-    print(f"telegram-listener: greeted stranger chat {chat_id} (once)")
+    log(f"telegram-listener: greeted stranger chat {chat_id} (once)")
+
+
+def handle_update(update, wanted):
+    """Handle one update and advance the offset past it. Never raises (#15).
+
+    Before this guard, one unexpected exception in a per-update path — a
+    failed stranger greet during an egress hiccup, a non-JSON API response
+    (json.JSONDecodeError, in no caught set), an OSError starting pi —
+    propagated out of main() and killed the listener; with no restart
+    policy the channel then stayed dead until a human noticed (the
+    2026-11-06 silent-death incident, ~8 hours). Now:
+
+    - A HANDLING failure is logged with the update id and the update is
+      skipped — the offset still advances past it, so one poison update
+      cannot stall every message queued behind it. The skip is loud in
+      the log, never silent.
+    - An OFFSET-WRITE failure (e.g. state-mount trouble) backs off and
+      returns False so the caller stops the batch and re-fetches: nothing
+      is confirmed to Telegram until it is persisted, so the update is
+      retried rather than lost. A retried update may be handled twice
+      (a duplicate reply — recoverable), the same trade a crash makes.
+    """
+    uid = update.get("update_id")
+    if uid is None:
+        # Telegram guarantees update_id; without it we can neither handle
+        # nor advance the watermark. Log and carry on with the next one.
+        log("telegram-listener: ERROR: update without update_id; skipping "
+              "(should never happen)")
+        return True
+    try:
+        msg = update.get("message") or {}
+        chat = str((msg.get("chat") or {}).get("id", ""))
+        text = msg.get("text")
+        if not text:
+            if chat == wanted and msg:
+                handle_support_nontext(msg)
+            # Other textless updates are skipped, by decision rather than
+            # omission (#11): stranger media (their greet happened or
+            # follows their first text), service notices (joins, pins), and
+            # non-message updates (edits, reactions — the original message
+            # was already handled).
+        elif chat == wanted:
+            handle_support_message(text)
+        else:
+            greet_stranger(chat)
+    except Exception as e:
+        log(f"telegram-listener: ERROR: update {uid}: handling raised "
+              f"{e!r}; logged and skipping to the next update (#15)")
+    try:
+        write_offset(uid + 1)
+    except OSError as e:
+        log(f"telegram-listener: ERROR: update {uid}: cannot persist the "
+              f"offset ({e}); backing off {ERROR_BACKOFF}s — the update is "
+              "not confirmed and will be re-fetched")
+        time.sleep(ERROR_BACKOFF)
+        return False
+    return True
 
 
 def lock_status():
@@ -294,33 +387,66 @@ def lock_status():
     return "clear", f"stale lock ({host}, {int(age)}s old)"
 
 
+def wait_for_clear_lock():
+    """Park until no other instance is live, then return the lock info.
+
+    This guard used to EXIT on a fresh LIVE lock. Under sprout-telegram's
+    restart policy (#16) an exiting guard crash-loops whenever another
+    instance is legitimately live (e.g. a Superconductor session holding
+    the lock) — the exact pathology the policy was meant to cure. A daemon
+    waits for its preconditions instead: recheck every
+    LOCK_RECHECK_SECONDS, proceed when the lock clears or goes stale.
+    start.sh's own LIVE check is untouched: an operator starting a full
+    stack against a live instance still gets a hard stop before anything
+    is built.
+    """
+    while _running:
+        state, info = lock_status()
+        if state == "clear":
+            return info
+        log(f"telegram-listener: another instance is live ({info}); "
+              f"rechecking in {LOCK_RECHECK_SECONDS}s (#16)")
+        time.sleep(LOCK_RECHECK_SECONDS)
+    sys.exit("telegram-listener: stopped while waiting for the LIVE lock")
+
+
 def handling_guard():
     """Serialize message handling across ALL listener processes.
 
     The duplicate wake of 2026-11-05 (two boots, two replies, one ping)
     proved that 'something' can double-fire. Whatever the cause — two
-    listeners, a retry, a race — a non-blocking flock on a shared file
-    makes concurrent handling impossible: the second contender skips and
-    logs instead of waking a second Sprout. The lock releases when the
-    process holding it exits (kernel guarantee), so crashes cannot wedge.
+    listeners, a retry, a race — a flock on a shared file makes concurrent
+    handling impossible: the second contender waits instead of waking a
+    second Sprout. Waiting, not refusing: under a restart policy (#16) a
+    refusing contender crash-loops. The flock is polled with LOCK_NB plus
+    a sleep rather than one blocking call, so SIGTERM still stops the
+    wait; the kernel releases the lock when the holder exits, so a crash
+    can never wedge the queue.
     """
     os.makedirs(STATE_DIR, exist_ok=True)
     fh = open(HANDLING_LOCK_PATH, "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh  # caller keeps it open for the lifetime of the listener
+    while _running:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh  # caller keeps it open for the lifetime of the listener
+        except OSError:
+            log("telegram-listener: another handler holds the handling "
+                  f"lock; rechecking in {LOCK_RECHECK_SECONDS}s")
+            time.sleep(LOCK_RECHECK_SECONDS)
+    fh.close()
+    sys.exit("telegram-listener: stopped while waiting for the handling lock")
 
 
 def main():
     """Poll forever: consume updates, act on support messages, greet strangers.
 
     The loop in five parts:
-      0. Guards: refuse to start if another instance is live, and take the
-         handling flock so no two handlers ever run at once.
-      1. Install signal handlers so shutdowns are clean (SIGTERM/SIGINT).
+      0. Install signal handlers FIRST, so the guard waits below (and every
+         later sleep) still stop cleanly on SIGTERM/SIGINT.
+      1. Guards: park while another instance holds a fresh LIVE lock, then
+         take the handling flock — both by waiting and rechecking, never
+         by exiting, because under the restart policy (#16) an exit here
+         is a crash-loop.
       2. Work out who the support entity is (from people.md) and who we are
          (getMe), then say both aloud in the log.
       3. On the very first run only: skip history entirely by starting from
@@ -330,25 +456,19 @@ def main():
          AFTER, so a crash can replay a message (a duplicate reply is
          recoverable) but never silently lose one.
     """
-    # --- 0. Guards ------------------------------------------------------------
-    state, info = lock_status()
-    if state == "live":
-        sys.exit(f"telegram-listener: another instance is live ({info}). "
-                 "The listener and an interactive session never run together — "
-                 "shut one down first (runbook §7).")
-    guard = handling_guard()
-    if guard is None:
-        sys.exit("telegram-listener: another handler is already active; refusing to double-fire.")
-
-    # --- 1. Clean shutdown on signals ---------------------------------------
+    # --- 0. Clean shutdown on signals ---------------------------------------
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    # --- 1. Guards: wait out a live instance, then serialize handling -------
+    info = wait_for_clear_lock()
+    guard = handling_guard()
+
     # --- 2. Who is talking, and who is listening -----------------------------
-    print(f"telegram-listener: guards passed ({info})")
+    log(f"telegram-listener: guards passed ({info}; handling flock held)")
     wanted = support_entity_chat_id()
     me = api_with_retry("getMe")
-    print(f"telegram-listener: polling as @{me['username']}; "
+    log(f"telegram-listener: polling as @{me['username']}; "
           f"acting on chat {wanted}; offset {read_offset() or 'latest'}")
 
     # --- 3. First run: start from the latest update, no history replay -------
@@ -364,33 +484,21 @@ def main():
         try:
             updates = api("getUpdates", timeout=POLL_TIMEOUT, offset=read_offset())
         except (urllib.error.URLError, RuntimeError) as e:
-            print(f"telegram-listener: {e}; retrying in {ERROR_BACKOFF}s")
+            log(f"telegram-listener: {e}; retrying in {ERROR_BACKOFF}s")
             time.sleep(ERROR_BACKOFF)
             continue
 
         # 4b. Handle each update, THEN advance the offset. Handle-first means
         # at-least-once delivery: a crash mid-handling may replay a message
         # (a duplicate reply — recoverable and visible) but cannot lose it
-        # silently (a lost support message — much worse).
+        # silently (a lost support message — much worse). handle_update()
+        # catches and logs any unexpected exception (#15 — one bad update
+        # must never kill the loop); it returns False only when the offset
+        # could not be persisted, in which case we stop the batch and
+        # re-fetch rather than confirm anything.
         for update in updates:
-            msg = update.get("message") or {}
-            chat = str((msg.get("chat") or {}).get("id", ""))
-            text = msg.get("text")
-            if not text:
-                if chat == wanted and msg:
-                    handle_support_nontext(msg)
-                # Other textless updates are still skipped, now by decision
-                # rather than omission (#11): stranger media (their greet
-                # happened or follows their first text), service notices
-                # (joins, pins), and non-message updates (edits, reactions
-                # — the original message was already handled).
-                write_offset(update["update_id"] + 1)
-                continue
-            if chat == wanted:
-                handle_support_message(text)
-            else:
-                greet_stranger(chat)
-            write_offset(update["update_id"] + 1)
+            if not handle_update(update, wanted):
+                break
 
 
 if __name__ == "__main__":

@@ -11,3 +11,6 @@
 # Python build artifacts
 __pycache__/
 *.pyc
+
+# Listener logs persist here on the host (issue #17) — evidence, not code
+/listener-logs/

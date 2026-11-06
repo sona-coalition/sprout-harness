@@ -167,14 +167,22 @@ podman run -d --name sprout-egress \
 # Set SPROUT_LISTENER=off to skip it.
 #
 # Concurrency note (v1): if a human is mid-conversation in the interactive
-# session below (which then holds the LIVE lock), a listener-booted `pi -p`
-# will see the fresh lock and politely report not-live in the listener's
-# logs — no corruption, no double-self; the next message retries. The
+# session below (which then holds the LIVE lock), the listener PARKS — it
+# rechecks the lock instead of exiting, because under --restart (#16) an
+# exiting guard would crash-loop. Once polling, a listener-booted `pi -p`
+# that sees a fresh lock politely reports not-live in the listener's logs
+# — no corruption, no double-self; the next message retries. The
 # resident-mode successor (runbook §6 note) removes this overlap properly.
 if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
   echo "(Re)starting Telegram listener (SPROUT_LISTENER=off to disable)..."
   podman rm -f sprout-telegram >/dev/null 2>&1 || true
+  # Logs persist on the HOST (#17): podman-held stdout dies with the
+  # container, and the rm -f above is exactly what destroyed the
+  # 2026-11-06 incident evidence. The listener appends to
+  # telegram-listener.log in this directory across recreations.
+  mkdir -p "$PWD/listener-logs"
   podman run -d --name sprout-telegram \
+    --restart unless-stopped \
     --network sprout-inside \
     --env-file "$ENV_FILE" \
     -e HTTP_PROXY=http://sprout-egress:3128 \
@@ -184,8 +192,9 @@ if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
     --memory 1g --cpus 1 --pids-limit 256 \
     -v "$PWD/sprout:/home/sprout/sprout:Z" \
     -v "$PWD/sprout/sprout-private:/home/sprout/sprout/sprout-private:Z" \
+    -v "$PWD/listener-logs:/var/log/sprout:Z" \
     sprout telegram-listener.py
-  echo "  (listener logs: podman logs -f sprout-telegram)"
+  echo "  (listener logs: listener-logs/telegram-listener.log on this host — persists across recreation; podman logs -f sprout-telegram for the live container)"
 fi
 
 # --- 6. Start the agent ------------------------------------------------------
