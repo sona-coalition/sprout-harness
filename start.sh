@@ -167,14 +167,17 @@ podman run -d --name sprout-egress \
 # Set SPROUT_LISTENER=off to skip it.
 #
 # Concurrency note (v1): if a human is mid-conversation in the interactive
-# session below (which then holds the LIVE lock), a listener-booted `pi -p`
-# will see the fresh lock and politely report not-live in the listener's
-# logs — no corruption, no double-self; the next message retries. The
+# session below (which then holds the LIVE lock), the listener PARKS — it
+# rechecks the lock instead of exiting, because under --restart (#16) an
+# exiting guard would crash-loop. Once polling, a listener-booted `pi -p`
+# that sees a fresh lock politely reports not-live in the listener's logs
+# — no corruption, no double-self; the next message retries. The
 # resident-mode successor (runbook §6 note) removes this overlap properly.
 if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
   echo "(Re)starting Telegram listener (SPROUT_LISTENER=off to disable)..."
   podman rm -f sprout-telegram >/dev/null 2>&1 || true
   podman run -d --name sprout-telegram \
+    --restart unless-stopped \
     --network sprout-inside \
     --env-file "$ENV_FILE" \
     -e HTTP_PROXY=http://sprout-egress:3128 \
