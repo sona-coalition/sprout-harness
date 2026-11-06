@@ -40,6 +40,9 @@ SAFEGUARDS
 - Runs only inside the live instance's container; start.sh's LIVE-lock
   check is what keeps two listeners from polling the same bot (Telegram
   409 Conflict is the tell if that ever happens).
+- One bad update cannot kill the channel: every per-update handling path
+  in the poll loop is guarded, unexpected exceptions are logged with the
+  update id, and the loop carries on (issue #15).
 - stdlib only — no pip installs, same trust as the base image.
 
 Requires TELEGRAM_BOT_TOKEN in the environment (from the harness env file).
@@ -272,6 +275,63 @@ def greet_stranger(chat_id):
     print(f"telegram-listener: greeted stranger chat {chat_id} (once)")
 
 
+def handle_update(update, wanted):
+    """Handle one update and advance the offset past it. Never raises (#15).
+
+    Before this guard, one unexpected exception in a per-update path — a
+    failed stranger greet during an egress hiccup, a non-JSON API response
+    (json.JSONDecodeError, in no caught set), an OSError starting pi —
+    propagated out of main() and killed the listener; with no restart
+    policy the channel then stayed dead until a human noticed (the
+    2026-11-06 silent-death incident, ~8 hours). Now:
+
+    - A HANDLING failure is logged with the update id and the update is
+      skipped — the offset still advances past it, so one poison update
+      cannot stall every message queued behind it. The skip is loud in
+      the log, never silent.
+    - An OFFSET-WRITE failure (e.g. state-mount trouble) backs off and
+      returns False so the caller stops the batch and re-fetches: nothing
+      is confirmed to Telegram until it is persisted, so the update is
+      retried rather than lost. A retried update may be handled twice
+      (a duplicate reply — recoverable), the same trade a crash makes.
+    """
+    uid = update.get("update_id")
+    if uid is None:
+        # Telegram guarantees update_id; without it we can neither handle
+        # nor advance the watermark. Log and carry on with the next one.
+        print("telegram-listener: ERROR: update without update_id; skipping "
+              "(should never happen)")
+        return True
+    try:
+        msg = update.get("message") or {}
+        chat = str((msg.get("chat") or {}).get("id", ""))
+        text = msg.get("text")
+        if not text:
+            if chat == wanted and msg:
+                handle_support_nontext(msg)
+            # Other textless updates are skipped, by decision rather than
+            # omission (#11): stranger media (their greet happened or
+            # follows their first text), service notices (joins, pins), and
+            # non-message updates (edits, reactions — the original message
+            # was already handled).
+        elif chat == wanted:
+            handle_support_message(text)
+        else:
+            greet_stranger(chat)
+    except Exception as e:
+        print(f"telegram-listener: ERROR: update {uid}: handling raised "
+              f"{e!r}; logged and skipping to the next update (#15)")
+    try:
+        write_offset(uid + 1)
+    except OSError as e:
+        print(f"telegram-listener: ERROR: update {uid}: cannot persist the "
+              f"offset ({e}); backing off {ERROR_BACKOFF}s — the update is "
+              "not confirmed and will be re-fetched")
+        time.sleep(ERROR_BACKOFF)
+        return False
+    return True
+
+
 def lock_status():
     """Inspect the LIVE lock without taking it.
 
@@ -371,26 +431,14 @@ def main():
         # 4b. Handle each update, THEN advance the offset. Handle-first means
         # at-least-once delivery: a crash mid-handling may replay a message
         # (a duplicate reply — recoverable and visible) but cannot lose it
-        # silently (a lost support message — much worse).
+        # silently (a lost support message — much worse). handle_update()
+        # catches and logs any unexpected exception (#15 — one bad update
+        # must never kill the loop); it returns False only when the offset
+        # could not be persisted, in which case we stop the batch and
+        # re-fetch rather than confirm anything.
         for update in updates:
-            msg = update.get("message") or {}
-            chat = str((msg.get("chat") or {}).get("id", ""))
-            text = msg.get("text")
-            if not text:
-                if chat == wanted and msg:
-                    handle_support_nontext(msg)
-                # Other textless updates are still skipped, now by decision
-                # rather than omission (#11): stranger media (their greet
-                # happened or follows their first text), service notices
-                # (joins, pins), and non-message updates (edits, reactions
-                # — the original message was already handled).
-                write_offset(update["update_id"] + 1)
-                continue
-            if chat == wanted:
-                handle_support_message(text)
-            else:
-                greet_stranger(chat)
-            write_offset(update["update_id"] + 1)
+            if not handle_update(update, wanted):
+                break
 
 
 if __name__ == "__main__":
