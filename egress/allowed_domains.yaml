@@ -27,3 +27,9 @@ domains:
   - domain: google.com          # general queries
   - domain: pi.dev              # pi harness documentation
   - domain: bbc.co.uk           # news and current affairs
+  # organisation#23 (2026-11-06): local-model research — model cards and
+  # metadata APIs. NOT included, each a separate future decision (issue #13):
+  # *.hf.space (user-content host, like githubusercontent.com) and the
+  # model-file CDN hosts (cas-bridge.xethub.hf.co, cdn-lfs*.hf.co) — needed
+  # only when something inside the container downloads weights.
+  - domain: huggingface.co      # model hub: cards, metadata, leaderboards
