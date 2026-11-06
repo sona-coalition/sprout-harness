@@ -176,6 +176,11 @@ podman run -d --name sprout-egress \
 if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
   echo "(Re)starting Telegram listener (SPROUT_LISTENER=off to disable)..."
   podman rm -f sprout-telegram >/dev/null 2>&1 || true
+  # Logs persist on the HOST (#17): podman-held stdout dies with the
+  # container, and the rm -f above is exactly what destroyed the
+  # 2026-11-06 incident evidence. The listener appends to
+  # telegram-listener.log in this directory across recreations.
+  mkdir -p "$PWD/listener-logs"
   podman run -d --name sprout-telegram \
     --restart unless-stopped \
     --network sprout-inside \
@@ -187,8 +192,9 @@ if [ "${SPROUT_LISTENER:-on}" != "off" ]; then
     --memory 1g --cpus 1 --pids-limit 256 \
     -v "$PWD/sprout:/home/sprout/sprout:Z" \
     -v "$PWD/sprout/sprout-private:/home/sprout/sprout/sprout-private:Z" \
+    -v "$PWD/listener-logs:/var/log/sprout:Z" \
     sprout telegram-listener.py
-  echo "  (listener logs: podman logs -f sprout-telegram)"
+  echo "  (listener logs: listener-logs/telegram-listener.log on this host — persists across recreation; podman logs -f sprout-telegram for the live container)"
 fi
 
 # --- 6. Start the agent ------------------------------------------------------
