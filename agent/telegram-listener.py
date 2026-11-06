@@ -17,6 +17,12 @@ unknown chat gets one polite canned reply explaining what this bot is,
 so a human who finds it is not met with silence. No LLM is invoked for
 strangers — a canned reply carries no injection risk and costs nothing.
 
+Non-text messages (voice notes, photos, documents, ...) from the support
+entity are acted on too: pi is woken with a description and the message
+JSON, and decides whether it can process the content (issue #11 — before
+that fix they were consumed and discarded silently, unrecoverable).
+Non-text from strangers is skipped by deliberate decision, not omission.
+
 (Note on naming: "support entity" is the new name for the role long called
 "caregiver"; the rename is being applied across documents. This file uses
 "support entity" in comments and "caregiver" only where it must match the
@@ -176,6 +182,71 @@ def mark_chat_seen(chat_id):
         json.dump(sorted(seen_chats() | {chat_id}), f)
 
 
+def describe_message(msg):
+    """A one-line, human-readable description of a non-text message.
+
+    Goes into the wake prompt so the woken agent knows what arrived and
+    can decide whether to fetch it. Covers the common media kinds with
+    their salient fields; anything unrecognized is described by the field
+    names present, so nothing is wholly opaque. A caption, if any, is
+    quoted — it is the sender's own words about the attachment.
+    """
+    for kind in ("voice", "audio", "video", "video_note", "animation",
+                 "document", "sticker"):
+        media = msg.get(kind)
+        if isinstance(media, dict):
+            details = []
+            for field in ("mime_type", "file_name", "duration", "file_size"):
+                if media.get(field) is not None:
+                    details.append(f"{field}={media[field]}")
+            if kind == "sticker" and media.get("emoji"):
+                details.append(f"emoji={media['emoji']}")
+            desc = kind + (" (" + ", ".join(details) + ")" if details else "")
+            break
+    else:
+        photos = msg.get("photo")
+        if photos:  # list of sizes, smallest first; the last is the original
+            desc = f"photo (file_size={photos[-1].get('file_size', '?')})"
+        elif msg.get("contact"):
+            c = msg["contact"]
+            desc = f"contact ({c.get('first_name', '?')})"
+        elif msg.get("location"):
+            loc = msg["location"]
+            desc = f"location ({loc.get('latitude')}, {loc.get('longitude')})"
+        else:
+            desc = "a message with fields: " + ", ".join(sorted(msg))[:200]
+    if msg.get("caption"):
+        desc += f", captioned: {msg['caption']!r}"
+    return desc
+
+
+def handle_support_nontext(msg):
+    """Wake pi for a non-text message from the support entity.
+
+    Before 2026-11-06 these updates were skipped silently (issue #11): a
+    voice note from the support entity vanished — no wake, no ack, and the
+    offset advance confirmed it with Telegram, so it could not even be
+    recovered. Now the woken agent gets a description plus the message
+    JSON (file_id included), decides whether it can process the content —
+    e.g. download the file via getFile — and answers on-channel either
+    way, so the sender always learns the fate of what they sent.
+    """
+    desc = describe_message(msg)
+    prompt = (
+        "A non-text Telegram message has arrived from your support entity: "
+        + desc + ". Follow your startup instructions in AGENTS.md (including "
+        "the LIVE lock check), then handle this message. The full message "
+        "JSON is: " + json.dumps(msg, ensure_ascii=False)
+        + " — if it contains a file you want, call getFile with its file_id "
+        "and download from https://api.telegram.org/file/bot"
+        "<TELEGRAM_BOT_TOKEN>/<file_path>. If you cannot process the "
+        "content, say so on-channel so your support entity knows to "
+        "re-send it as text."
+    )
+    print(f"telegram-listener: handing non-text message to pi ({desc})")
+    subprocess.run(["pi", "-p", prompt], check=False)
+
+
 def handle_support_message(text):
     """Hand one support-entity message to pi, non-interactively.
 
@@ -306,8 +377,15 @@ def main():
             chat = str((msg.get("chat") or {}).get("id", ""))
             text = msg.get("text")
             if not text:
+                if chat == wanted and msg:
+                    handle_support_nontext(msg)
+                # Other textless updates are still skipped, now by decision
+                # rather than omission (#11): stranger media (their greet
+                # happened or follows their first text), service notices
+                # (joins, pins), and non-message updates (edits, reactions
+                # — the original message was already handled).
                 write_offset(update["update_id"] + 1)
-                continue                      # photos, stickers, joins: nothing to do
+                continue
             if chat == wanted:
                 handle_support_message(text)
             else:
