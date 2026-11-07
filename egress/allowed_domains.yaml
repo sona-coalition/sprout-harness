@@ -33,3 +33,14 @@ domains:
   # model-file CDN hosts (cas-bridge.xethub.hf.co, cdn-lfs*.hf.co) — needed
   # only when something inside the container downloads weights.
   - domain: huggingface.co      # model hub: cards, metadata, leaderboards
+  # organisation#23 (2026-11-07): local-model trial — LM Studio serving on
+  # the Mac, reached as host.containers.internal (podman's name for the host;
+  # the Mac's LAN IP is the recorded fallback if the egress container cannot
+  # resolve or reach that name). STATED PLAINLY: for plain HTTP this proxy
+  # filters by host only, not by port or method — so these entries open EVERY
+  # plain-HTTP service on the Mac to the agent, not just LM Studio on 1234.
+  # Accepted deliberately by the caregiver for the trial on a trusted home
+  # network (Telegram, 2026-11-07); a proxy design review is the recorded
+  # follow-up.
+  - domain: host.containers.internal
+  - domain: 192.168.1.139

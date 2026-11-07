@@ -3,6 +3,19 @@
     "openrouter": {
       "apiKey": "$OPENROUTER_API_KEY",
       "authHeader": true
+    },
+    "lmstudio": {
+      "baseUrl": "http://host.containers.internal:1234/v1",
+      "api": "openai-completions",
+      "apiKey": "lm-studio",
+      "models": [
+        {
+          "id": "gemma-4-12b-it-mlx",
+          "name": "Gemma 4 12B IT (MLX, via LM Studio on the Mac)",
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        }
+      ]
     }
   }
 }
