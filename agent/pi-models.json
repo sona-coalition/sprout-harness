@@ -5,7 +5,7 @@
       "authHeader": true
     },
     "lmstudio": {
-      "baseUrl": "http://host.containers.internal:1234/v1",
+      "baseUrl": "http://127.0.0.1:8399/v1",
       "api": "openai-completions",
       "apiKey": "lm-studio",
       "models": [

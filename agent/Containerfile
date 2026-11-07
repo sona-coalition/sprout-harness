@@ -48,6 +48,18 @@ COPY pi-models.json /root/.pi/agent/models.json
 # `telegram-listener.py` inside the container, or `podman exec sprout telegram-listener.py`.
 COPY telegram-listener.py /usr/local/bin/telegram-listener.py
 
+# The LM Studio relay (issue #23): pi's proxy handling cannot reach the
+# plain-HTTP, non-443 LM Studio host through the egress squid (CONNECT is
+# 443-only there), and direct connections are impossible on the internal
+# network. local-relay.py bridges: it listens on 127.0.0.1:8399 and
+# re-issues requests to the proxy in forward-proxy form, upstream pinned
+# to the LM Studio host. sprout-entrypoint.sh starts the relay and sets
+# NO_PROXY for loopback before running the container's command, so the
+# lmstudio provider works in both the interactive and listener containers.
+COPY local-relay.py /usr/local/bin/local-relay.py
+COPY sprout-entrypoint.sh /usr/local/bin/sprout-entrypoint.sh
+RUN chmod +x /usr/local/bin/sprout-entrypoint.sh
+
 # Git identity: Sprout acts on GitHub as "sprout-graft", and its commits and
 # pull requests are recorded as sprout-graft <sprout-graft@omail.sh>.
 # Setting this system-wide in the image keeps that identity consistent
@@ -74,4 +86,7 @@ WORKDIR /home/sprout/sprout
 
 # When the container starts interactively, give the operator a shell.
 # The operator (or a runbook procedure) then runs `pi` themselves.
+# The ENTRYPOINT wrapper (relay + NO_PROXY, see above) runs first for
+# every command this image is started with, including this shell.
+ENTRYPOINT ["/usr/local/bin/sprout-entrypoint.sh"]
 CMD ["bash"]
