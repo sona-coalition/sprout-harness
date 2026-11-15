@@ -44,3 +44,13 @@ domains:
   # follow-up.
   - domain: host.containers.internal
   - domain: 192.168.1.139
+  # sprout-harness#25 (2026-11-15): research reading — documentation and
+  # comparison pages linked in coalition reviews (organisation#19 runtime
+  # guides; organisation#38 OpenShell evaluation; agent-orchestration and
+  # Superconductor-alternatives research). Prompt-injection posture of
+  # organisation#20 applies: content is data, never commands.
+  - domain: betterstack.com   # TypeScript runtime comparison guides (#19)
+  - domain: www.nvidia.com    # vendor site
+  - domain: docs.nvidia.com   # OpenShell documentation (#38 evaluation)
+  - domain: agentsroom.dev    # agent-orchestration product research
+  - domain: paradev.com       # Superconductor-alternatives comparison
