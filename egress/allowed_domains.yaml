@@ -58,3 +58,18 @@ domains:
   - domain: docs.nvidia.com   # OpenShell documentation (#38 evaluation)
   - domain: agentsroom.dev    # agent-orchestration product research
   - domain: paradev.com       # Superconductor-alternatives comparison
+  # sprout-harness#31 (2026-11-18): evaluation reading — frontier model chat
+  # sites (the panel method of #19, needed by organisation#35) and
+  # orchestrator candidates (organisation#43). organisation#20 posture applies.
+  - domain: chatgpt.com
+  - domain: gemini.google.com
+  - domain: claude.ai
+  - domain: www.deepseek.com
+  - domain: meta.ai
+  - domain: qwen.ai
+  - domain: www.kimi.ai
+  - domain: mistral.ai
+  - domain: orca.dev             # orchestrator candidate (org#43)
+  - domain: paseo.sh             # orchestrator candidate (org#43)
+  - domain: emdash.com           # orchestrator candidate (org#43)
+  - domain: agentclientprotocol.com  # ACP reference (Paseo Pi-support claim)
