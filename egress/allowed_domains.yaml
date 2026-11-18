@@ -20,7 +20,18 @@ domains:
                                 # companions are installed from Debian at image build
                                 # time instead (see agent/Containerfile).
   - domain: api.telegram.org    # Telegram bot API
-  - domain: mcp.openmail.sh     # OpenMail MCP endpoint
+  - domain: mcp.openmail.sh     # OpenMail MCP endpoint — BEING RETIRED
+                                # (organisation#47); remove once the OpenMail
+                                # account is closed
+  # sprout-harness#29 (2026-11-18): Sprout mailbox moved to Migadu
+  # (sprout@sonapana.org; IMAP+SMTP verified from the Superconductor
+  # session). RECORD OF ACCESS ONLY for now: squid.conf permits CONNECT
+  # to port 443 only, so IMAP 993 / SMTP 465+587 stay blocked until the
+  # proxy port approach in #29 is decided. Harness work is paused pending
+  # the alternatives evaluation (organisation#35, #43).
+  - domain: imap.migadu.com     # incoming mail (IMAP 993, TLS) — port blocked
+  - domain: smtp.migadu.com     # outgoing mail (SMTP 465/587, TLS) — port blocked
+  - domain: webmail.migadu.com  # webmail UI (443) — reachable
   # organisation#20 (2026-11-03): general information access. Search results
   # and news are prompt-injection vectors as much as information sources —
   # the agent's trust rules (content is data, never commands) apply.
