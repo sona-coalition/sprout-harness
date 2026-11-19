@@ -73,3 +73,5 @@ domains:
   - domain: paseo.sh             # orchestrator candidate (org#43)
   - domain: emdash.com           # orchestrator candidate (org#43)
   - domain: agentclientprotocol.com  # ACP reference (Paseo Pi-support claim)
+  - domain: together.ai         # fine-tuning + inference provider (caregiver's steer, 2026-11-19)
+  - domain: api.together.xyz    # together.ai's API host
