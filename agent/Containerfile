@@ -37,6 +37,28 @@ RUN npm install -g @earendil-works/pi-coding-agent
 # instance is the same mind, not just the same instructions. The apiKey value
 # is the literal string "$OPENROUTER_API_KEY" — pi expands it from the
 # environment at call time, so no secret is baked into the image.
+#
+# WHY TWO FILES, AND WHY THEY LOOK ASYMMETRICAL (issue #23):
+#   settings.json — WHERE THE DEFAULTS LIVE. pi reads defaultProvider,
+#     defaultModel and defaultThinkingLevel from here and nowhere else; it
+#     has no equivalent field in models.json. Deleting this file would not
+#     merely move the pin, it would drop the container back to pi's
+#     "Automatic" provider/model and "medium" thinking, silently undoing
+#     PR #7 ("Pin the model").
+#   models.json — provider endpoints and credentials only. OpenRouter is a
+#     BUILT-IN provider with a live catalog: given a key, pi lists every
+#     OpenRouter chat model that key may use, fetched from OpenRouter's
+#     /models/user endpoint. So it needs no `models` array here, and adding
+#     one would be a regression — a `models` entry REPLACES the catalog
+#     entry for that id, trading live context limits and pricing for
+#     hand-written values that go stale. A custom endpoint (LM Studio was
+#     one) is the opposite case: no catalog, so its models must be declared.
+#     That is the whole asymmetry — two kinds of provider, not an oversight.
+#   The lmstudio provider was removed under #23: its host entries left the
+#   egress allowlist in #27, and under the conceptual architecture
+#   (organisation PR #40) the agent must not know where the host machine
+#   lives. Model choice at runtime is `pi --model <provider/model>`;
+#   only these defaults need a rebuild.
 RUN mkdir -p /root/.pi/agent
 COPY pi-settings.json /root/.pi/agent/settings.json
 COPY pi-models.json /root/.pi/agent/models.json
